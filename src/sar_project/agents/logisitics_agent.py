@@ -2,6 +2,7 @@ from .base_agent import SARBaseAgent
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
+import random
 load_dotenv()
 genai.configure(api_key = os.getenv("GOOGLE_API_KEY"))
 
@@ -33,8 +34,8 @@ class Supplier():
     def remove_provided_good(self, good):
         self.provides.remove(good)
 
-    def ship_good(self, good, destination, amt):
-        destination.recieve_good(good, amt) # Need way to add delay
+    def ship_good(self, good, amt): #Stub used for consistency
+        return amt
 
 class Mission():
     def __init__(self, name):
@@ -56,6 +57,9 @@ class Mission():
     def remove_connection(self, to_disconnect):
         del self.connections[to_disconnect]
 
+    def get_curr_store(self):
+        return self.has
+
     def add_required_good(self, good, amt): #goods are strings?
         self.requires[good] = amt
     
@@ -66,17 +70,18 @@ class Mission():
         return self.requires
 
     def recieve_good(self, good, amount):
+        if good in self.has:
+            self.has[good] = self.has[good] + amount
+        else:
+            self.has[good] = amount
+
+    def recieve_good_transit(self, good, amount):
         if good in self.requires:
             currAmount = self.requires[good] - amount
             if currAmount < 0:
                 del self.requires[good]
-                self.has["good"] = -currAmount
             else:
                 self.requires[good] = currAmount
-        if good in self.has:
-            self.has["good"] = self.has["good"] + amount
-        else:
-            self.has["good"] = amount
             
 
 class Hub():
@@ -102,14 +107,14 @@ class Hub():
 
     def recieve_good(self, good, amount):
         if good in self.has:
-            self.has["good"] = self.has["good"] + amount
+            self.has[good] = self.has[good] + amount
         else:
-            self.has["good"] = amount
+            self.has[good] = amount
 
-    def ship_good(self, good, destination, amt):
+    def ship_good(self, good, amt):
         amt = min(amt, self.has[good])
         self.has[good] = self.has[good] - amt
-        destination.recieve_good(good, amt) # Need way to add delay, perhaps have a waiting array w/ items in transit.
+        return amt
         
 
 class LogisticsGraph():
@@ -117,6 +122,7 @@ class LogisticsGraph():
         self.suppliers = []
         self.hubs = []
         self.missions = []
+        self.goods_in_transit = []
 
     def get_nodes(self):
         nodes = self.suppliers + self.hubs + self.missions
@@ -148,6 +154,15 @@ class LogisticsGraph():
 
     def get_missions(self):
         return self.missions
+    
+    def get_good_transit(self):
+        return self.goods_in_transit
+
+    def add_good_transit(self, good, source, destination, qty, route, departure_time):
+        self.goods_in_transit.append((good, source, destination, qty, route, departure_time))
+
+    def remove_good_transit(self, transit):
+        self.goods_in_transit.remove(transit)
 
 
 class LogisticsAgent(SARBaseAgent):
@@ -162,6 +177,7 @@ class LogisticsAgent(SARBaseAgent):
             4. Monitor changing conditions"""
         )
         self.graph = LogisticsGraph()
+        self.time = 0
         
     def process_request(self, message):
         """Process logistics-related requests"""
@@ -191,11 +207,13 @@ class LogisticsAgent(SARBaseAgent):
         return requests
     
     def calculate_deliveries(self, method = "dijkstra"):
-        paths = []
+        paths = {}
         if method == "dijkstra":
             for mission in self.graph.get_missions():
+                paths[mission] = {}
                 reqs = mission.get_required_goods()
                 for req in reqs:
+                    paths[mission][req] = []
                     for supplier in self.graph.get_suppliers():
                         if req in supplier.get_provided_goods():
                             nodes = {node:None for node in self.graph.get_nodes()}
@@ -225,7 +243,8 @@ class LogisticsAgent(SARBaseAgent):
                             while currNode != None:
                                 path.append(currNode)
                                 currNode = nodes[currNode]
-                            paths.append(path)
+                            path.reverse()
+                            paths[mission][req] = path
             return paths            
         return -1
 
@@ -247,3 +266,30 @@ class LogisticsAgent(SARBaseAgent):
     def get_status(self):
         """Get the agent's current status"""
         return getattr(self, "status", "unknown")
+    
+    def make_delivery(self, good, qty, path):
+        qty = path[0].ship_good(good, qty) #If this crashes you shipped from an unacceptable location (mission)
+        self.graph.add_good_transit(good, path[0], path[1], qty, path, self.time)
+    
+    def run_time_tick(self):
+        #transit item format: (good, source, destination, qty, route, departure_time)
+        for transit in self.graph.get_good_transit():
+            if self.time == 10: #A huge aftershock of an earthquake blew up every van in transit, whoops
+                self.graph.remove_good_transit(transit)
+                transit[2].add_required_good(transit[0], transit[3])
+            elif (transit[5] + transit[1].get_connections()[transit[2]]) <= self.time: #good has traveled the distance
+                self.graph.remove_good_transit(transit)
+                curr_stop_index = transit[4].index(transit[2])
+                if curr_stop_index < len(transit[4])-1: #You still have steps in the path to go
+                    self.graph.add_good_transit(transit[0], transit[2], transit[4][curr_stop_index+1], transit[3], transit[4], self.time)
+                else:
+                    transit[2].recieve_good(transit[0], transit[3])
+
+        paths = self.calculate_deliveries()
+        for mission in paths:
+            for req in paths[mission]:
+                currPath = paths[mission][req]
+                self.graph.add_good_transit(req, currPath[0], currPath[1], 10, currPath, self.time)
+                mission.recieve_good_transit(req, 10) #Just assuming stuff can ship in batches of 10 now
+        self.time = self.time + 1
+        return self.time
